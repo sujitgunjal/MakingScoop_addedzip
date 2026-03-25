@@ -1,0 +1,7 @@
+click
+requests
+tqdm
+py7zr
+colorama
+gitpython
+pywin32
