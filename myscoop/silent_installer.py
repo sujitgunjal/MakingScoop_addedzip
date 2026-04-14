@@ -24,6 +24,12 @@ try:
 except ImportError:
     py7zr = None
 
+try:
+    from myscoop.gui_installer import GUIInstaller, GUIInstallError
+    _HAS_GUI_INSTALLER = True
+except ImportError:
+    _HAS_GUI_INSTALLER = False
+
 
 class SilentInstallError(Exception):
     """Raised when all silent install strategies fail."""
@@ -153,6 +159,16 @@ class SilentInstaller:
                 except Exception as e:
                     errors.append(f"Inno: {e}")
 
+        # Strategy 5: GUI automation (last resort)
+        if _HAS_GUI_INSTALLER:
+            try:
+                print("  Trying: GUI automation ...")
+                self._strategy_gui(filepath, app_dir)
+                print("  Strategy: GUI automation succeeded")
+                return True
+            except Exception as e:
+                errors.append(f"GUI: {e}")
+
         # All strategies failed
         error_details = "\n    ".join(errors)
         raise SilentInstallError(
@@ -241,6 +257,18 @@ class SilentInstaller:
                 f"Inno Setup exited with code {result.returncode}"
             )
 
+    def _strategy_gui(self, filepath: str, app_dir: str) -> None:
+        """Strategy 5: GUI automation — drive the installer wizard via UI tree."""
+        if not _HAS_GUI_INSTALLER:
+            raise RuntimeError(
+                "GUI automation requires pywinauto and psutil. "
+                "Run: pip install pywinauto pyautogui psutil"
+            )
+        gui = GUIInstaller()
+        success = gui.install(filepath, app_dir)
+        if not success:
+            raise RuntimeError("GUI automation reported failure")
+
     # ──────────────────────────────────────────────
     # Installer type detection
     # ──────────────────────────────────────────────
@@ -309,5 +337,6 @@ class SilentInstaller:
             "msi": self._strategy_msi,
             "nsis": self._strategy_nsis,
             "inno": self._strategy_inno,
+            "gui": self._strategy_gui,
         }
         return type_map.get(installer_type.lower())

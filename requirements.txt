@@ -5,3 +5,6 @@ py7zr
 colorama
 gitpython
 pywin32
+pywinauto
+pyautogui
+psutil

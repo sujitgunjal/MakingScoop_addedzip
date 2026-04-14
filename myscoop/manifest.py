@@ -253,6 +253,19 @@ class Manifest:
         return self.installer.get("args", [])
 
     @property
+    def installer_needs_gui(self) -> bool:
+        """True if the installer requires GUI automation (type='gui')."""
+        return self.installer_type.lower() == "gui"
+
+    @property
+    def gui_exe(self) -> str:
+        """
+        Relative path to the GUI setup executable inside the extracted dir.
+        e.g. 'AutomationBuilderSetup\\ABB_Setup.exe'
+        """
+        return self.installer.get("gui_exe", "")
+
+    @property
     def post_install(self) -> List[str]:
         """List of commands to run after installation."""
         return self._data.get("post_install", [])

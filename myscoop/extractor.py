@@ -360,6 +360,10 @@ class Extractor:
                 return "7z"
             if ".zip" in hint_lower:
                 return "zip"
+            if ".exe" in hint_lower:
+                return "7z"  # self-extracting exe → treat as 7z archive
+            if ".msi" in hint_lower:
+                return "msi"
 
         # 2. Manifest installer.type
         if installer_type:

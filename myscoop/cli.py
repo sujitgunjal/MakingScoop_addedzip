@@ -30,6 +30,12 @@ from myscoop.dependency import DependencyResolver, CircularDependencyError
 from myscoop.bucket import BucketManager, BucketError
 from myscoop.metadata import AppMetadata
 
+try:
+    from myscoop.gui_installer import GUIInstaller, GUIInstallError
+    _HAS_GUI_INSTALLER = True
+except ImportError:
+    _HAS_GUI_INSTALLER = False
+
 
 # ──────────────────────────────────────────────
 # Directory setup
@@ -101,6 +107,10 @@ def handle_errors(func):
             click.echo(f"\n{Fore.YELLOW}Cancelled by user.{Style.RESET_ALL}")
             sys.exit(1)
         except Exception as e:
+            # Catch GUIInstallError by name (module may not be installed)
+            if type(e).__name__ == "GUIInstallError":
+                click.echo(f"\n{Fore.RED}GUI Install Error: {e}{Style.RESET_ALL}")
+                sys.exit(1)
             click.echo(f"\n{Fore.RED}Unexpected error: {e}{Style.RESET_ALL}")
             sys.exit(1)
     wrapper.__name__ = func.__name__
@@ -116,6 +126,7 @@ def install_single_app(
     app_name: str,
     buckets_dir: str,
     is_dependency: bool = False,
+    local_file: Optional[str] = None,
 ) -> bool:
     """
     Install a single app (no dependency resolution — just download+extract+shim).
@@ -124,6 +135,7 @@ def install_single_app(
         app_name:       Name of the app.
         buckets_dir:    Buckets directory.
         is_dependency:  If True, print as dependency install.
+        local_file:     Optional path to a local installer exe (skips download).
 
     Returns:
         True if installed successfully.
@@ -150,8 +162,14 @@ def install_single_app(
             f"({manifest.version}) [64bit]{Style.RESET_ALL}"
         )
 
-    # Download
-    if manifest.url:
+    # Download or use local file
+    if local_file:
+        filepath = os.path.abspath(local_file)
+        if not os.path.isfile(filepath):
+            click.echo(f"{Fore.RED}  Local file not found: {filepath}{Style.RESET_ALL}")
+            return False
+        click.echo(f"{Fore.GREEN}  Using local file: {filepath}{Style.RESET_ALL}")
+    elif manifest.url:
         downloader = Downloader(CACHE_DIR)
         filepath = downloader.download(manifest.url, app_name, manifest.version)
     else:
@@ -163,15 +181,132 @@ def install_single_app(
         app_dir = os.path.join(APPS_DIR, app_name, manifest.version)
         os.makedirs(app_dir, exist_ok=True)
 
-        extractor = Extractor(APPS_DIR)
-        extractor.extract(
-            filepath=filepath,
-            app_name=app_name,
-            version=manifest.version,
-            extract_dir=manifest.extract_dir,
-            url_hint=manifest.url_hint,
-            installer_type=manifest.installer_type,
-        )
+        # For GUI installers with a local file:
+        #   1. Extract the self-extracting exe with 7z (no UAC)
+        #   2. Locate gui_exe inside the extracted dir
+        #   3. Run GUI automation on that specific setup exe
+        if manifest.installer_needs_gui and local_file:
+            # Step 1: Extract (treat as 7z self-extracting archive)
+            click.echo(
+                f"{Fore.BLUE}  Extracting "
+                f"{os.path.basename(filepath)} ...{Style.RESET_ALL}"
+            )
+            extractor = Extractor(APPS_DIR)
+            try:
+                extractor.extract(
+                    filepath=filepath,
+                    app_name=app_name,
+                    version=manifest.version,
+                    extract_dir=manifest.extract_dir,
+                    url_hint=f"#/{os.path.basename(filepath)}",
+                )
+            except Exception as e:
+                # If extraction fails (e.g. it's a standard non-SFX installer like InnoSetup),
+                # just log a warning and fallback to running the original exe
+                click.echo(f"{Fore.YELLOW}  Not a self-extracting archive. Running directly...{Style.RESET_ALL}")
+                pass
+
+            # Step 2: Find the gui_exe inside extracted dir
+            gui_exe = manifest.gui_exe
+            if gui_exe and os.path.isfile(os.path.join(app_dir, gui_exe)):
+                gui_exe_path = os.path.join(app_dir, gui_exe)
+            else:
+                # No gui_exe specified OR missing after failed extraction — fallback to original
+                gui_exe_path = filepath
+
+            if os.path.isfile(gui_exe_path):
+                click.echo(
+                    f"{Fore.BLUE}  Launching GUI automation on "
+                    f"{os.path.basename(gui_exe_path)} ...{Style.RESET_ALL}"
+                )
+                if _HAS_GUI_INSTALLER:
+                    gui = GUIInstaller()
+                    success = gui.install(gui_exe_path, app_dir)
+                    if success:
+                        click.echo(
+                            f"{Fore.GREEN}  GUI automation "
+                            f"completed ✓{Style.RESET_ALL}"
+                        )
+                    else:
+                        click.echo(
+                            f"{Fore.RED}  GUI automation "
+                            f"reported failure{Style.RESET_ALL}"
+                        )
+                else:
+                    click.echo(
+                        f"{Fore.YELLOW}  GUI automation unavailable. "
+                        f"Install deps: pip install pywinauto "
+                        f"pyautogui psutil{Style.RESET_ALL}"
+                    )
+            else:
+                click.echo(
+                    f"{Fore.YELLOW}  GUI exe not found after extraction: "
+                    f"{gui_exe_path}{Style.RESET_ALL}"
+                )
+                click.echo(
+                    f"{Fore.YELLOW}  Contents of app dir:{Style.RESET_ALL}"
+                )
+                for root, dirs, files in os.walk(app_dir):
+                    for f in files:
+                        rel = os.path.relpath(os.path.join(root, f), app_dir)
+                        click.echo(f"    {rel}")
+                    if len(list(os.walk(app_dir))) > 20:
+                        click.echo("    ... (truncated)")
+                        break
+
+        # For GUI installers downloaded from URL, extract first, then run gui_exe
+        elif manifest.installer_needs_gui:
+            extractor = Extractor(APPS_DIR)
+            extractor.extract(
+                filepath=filepath,
+                app_name=app_name,
+                version=manifest.version,
+                extract_dir=manifest.extract_dir,
+                url_hint=manifest.url_hint,
+            )
+
+            gui_exe = manifest.gui_exe
+            if gui_exe:
+                gui_exe_path = os.path.join(app_dir, gui_exe)
+                if os.path.isfile(gui_exe_path):
+                    click.echo(
+                        f"{Fore.BLUE}  Launching GUI automation for "
+                        f"setup wizard ...{Style.RESET_ALL}"
+                    )
+                    if _HAS_GUI_INSTALLER:
+                        gui = GUIInstaller()
+                        success = gui.install(gui_exe_path, app_dir)
+                        if success:
+                            click.echo(
+                                f"{Fore.GREEN}  GUI automation "
+                                f"completed ✓{Style.RESET_ALL}"
+                            )
+                        else:
+                            click.echo(
+                                f"{Fore.RED}  GUI automation "
+                                f"reported failure{Style.RESET_ALL}"
+                            )
+                    else:
+                        click.echo(
+                            f"{Fore.YELLOW}  GUI automation unavailable. "
+                            f"Install deps: pip install pywinauto "
+                            f"pyautogui psutil{Style.RESET_ALL}"
+                        )
+                else:
+                    click.echo(
+                        f"{Fore.YELLOW}  GUI exe not found: "
+                        f"{gui_exe_path}{Style.RESET_ALL}"
+                    )
+        else:
+            extractor = Extractor(APPS_DIR)
+            extractor.extract(
+                filepath=filepath,
+                app_name=app_name,
+                version=manifest.version,
+                extract_dir=manifest.extract_dir,
+                url_hint=manifest.url_hint,
+                installer_type=manifest.installer_type,
+            )
     else:
         app_dir = os.path.join(APPS_DIR, app_name, manifest.version)
         os.makedirs(app_dir, exist_ok=True)
@@ -295,8 +430,12 @@ def cli():
 
 @cli.command()
 @click.argument("app")
+@click.option(
+    "--file", "local_file", default=None, type=click.Path(exists=True),
+    help="Path to a local installer exe (skips download)."
+)
 @handle_errors
-def install(app: str):
+def install(app: str, local_file: Optional[str] = None):
     """Install an application."""
     buckets_dir = get_buckets_dir()
 
@@ -313,7 +452,9 @@ def install(app: str):
             click.echo(f"{Fore.BLUE}  Dependency '{dep_name}' already installed ✓{Style.RESET_ALL}")
             continue
 
-        install_single_app(dep_name, buckets_dir, is_dependency=is_dep)
+        # Only pass --file for the main app, not dependencies
+        file_arg = local_file if not is_dep else None
+        install_single_app(dep_name, buckets_dir, is_dependency=is_dep, local_file=file_arg)
 
 
 # ──────────────────────────────────────────────
