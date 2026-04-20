@@ -93,6 +93,15 @@ BUSY_TITLE_KEYWORDS = [
     "please wait", "progress", "processing", "configuring",
 ]
 
+BUSY_TEXT_KEYWORDS = [
+    "please wait while the installer initializes",
+    "please wait",
+    "reset plugin cache",
+    "this may take some minutes",
+    "installation manager",
+    "package manager",
+]
+
 # Button text → priority score (higher = click first)
 BUTTON_PRIORITY: Dict[str, int] = {
     # Completion (highest priority — means we're done)
@@ -163,6 +172,7 @@ LICENSE_KEYWORDS = [
     "i accept", "accept the agreement", "accept the terms",
     "i agree", "accept the license", "i have read",
     "read and accept", "agree to the terms",
+    "have read and agree", "license terms",
     "ich akzeptiere",  # German
     "j'accepte",       # French
 ]
@@ -176,8 +186,8 @@ LAUNCH_KEYWORDS = [
 
 # Control types to search for clickable elements (UIA)
 CLICKABLE_CONTROL_TYPES = [
-    "Button", "Hyperlink", "MenuItem", "ListItem",
-    "TreeItem", "TabItem", "SplitButton", "Custom",
+    "Button", "Hyperlink", "MenuItem", "TabItem", "SplitButton", "Custom",
+    "RadioButton", "CheckBox",
 ]
 
 # Class name patterns for buttons in various frameworks
@@ -214,6 +224,7 @@ class GUIInstaller:
 
     def __init__(
         self,
+        mode: str = "install",
         max_wait_for_window: int = 180,  # Extended for slow extractors
         max_pages: int = 100,            # Extended for multi-step installers
         stale_threshold: int = 45,       # Extended for complex UI updates
@@ -223,6 +234,7 @@ class GUIInstaller:
     ) -> None:
         """
         Args:
+            mode:                "install" or "uninstall" button-scoring mode.
             max_wait_for_window: Seconds to wait for installer window to appear.
             max_pages:           Safety limit on wizard pages before aborting.
             stale_threshold:     Seconds of no change before trying fallback keys.
@@ -230,6 +242,7 @@ class GUIInstaller:
             max_loop_interval:   Maximum sleep (exponential backoff ceiling).
             installation_timeout: Maximum total installation time in seconds.
         """
+        self.mode = (mode or "install").lower()
         self.max_wait_for_window = max_wait_for_window
         self.max_pages = max_pages
         self.stale_threshold = stale_threshold
@@ -243,6 +256,18 @@ class GUIInstaller:
         self._seen_window_titles: Set[str] = set()
         self._progress_detected: bool = False
         self._installer_name: str = ""
+        self._target_dir: str = ""
+        self._handled_special_windows: Set[int] = set()
+        self._install_priority = dict(BUTTON_PRIORITY)
+        self._uninstall_priority = dict(BUTTON_PRIORITY)
+        self._uninstall_priority.update({
+            "remove": 88,
+            "remove all": 88,
+            "uninstall": 88,
+            "uninstall now": 88,
+            "remove installation": 88,
+            "yes": 72,
+        })
 
     # ──────────────────────────────────────────────
     # Public API
@@ -283,6 +308,8 @@ class GUIInstaller:
         self._seen_window_titles = set()
         self._progress_detected = False
         self._installer_name = os.path.basename(installer_path).lower()
+        self._target_dir = app_dir
+        self._handled_special_windows = set()
 
         # Snapshot files before install (for tracking)
         pre_install_files = self._snapshot_directory(app_dir)
@@ -537,32 +564,75 @@ class GUIInstaller:
         if not norm:
             return -1
 
+        if self._is_non_action_label(norm):
+            return -1
+
+        skip_labels = set(SKIP_LABELS)
+        if self.mode == "uninstall":
+            skip_labels.discard("remove")
+            skip_labels.discard("uninstall")
+
         # Check skip labels first
-        for skip in SKIP_LABELS:
+        for skip in skip_labels:
             # We only check if the skip phrase is inside the button text.
             # Example: skip "cancel" is in button "cancel installation" -> Skip!
             # We DO NOT check 'norm in skip' because that would mean
             # button "install" would match skip "uninstall"!
-            if skip in norm:
+            if self._label_contains_phrase(norm, skip):
                 return 0
 
+        priority_map = (
+            self._uninstall_priority
+            if self.mode == "uninstall"
+            else self._install_priority
+        )
+
         # Exact match first
-        if norm in BUTTON_PRIORITY:
-            return BUTTON_PRIORITY[norm]
+        if norm in priority_map:
+            return priority_map[norm]
 
         # Partial match (e.g. "I Accept the terms" contains "i accept")
         for key, score in sorted(
-            BUTTON_PRIORITY.items(), key=lambda x: -x[1]
+            priority_map.items(), key=lambda x: -x[1]
         ):
-            if key in norm:
+            if self._label_contains_phrase(norm, key):
                 return score
 
         # Check for variations with special characters
         norm_clean = re.sub(r'[^a-z0-9\s]', '', norm)
-        if norm_clean in BUTTON_PRIORITY:
-            return BUTTON_PRIORITY[norm_clean]
+        if norm_clean in priority_map:
+            return priority_map[norm_clean]
 
         return -1  # Unknown button
+
+    def _label_contains_phrase(self, normalized_label: str, phrase: str) -> bool:
+        """Match button phrases on word boundaries to avoid heading false-positives."""
+        label = self._normalize_label(normalized_label)
+        target = self._normalize_label(phrase)
+        if not label or not target:
+            return False
+        if label == target:
+            return True
+
+        parts = [re.escape(part) for part in target.split()]
+        pattern = r"(?<![a-z0-9])" + r"\s+".join(parts) + r"(?![a-z0-9])"
+        return bool(re.search(pattern, label))
+
+    def _is_non_action_label(self, norm_label: str) -> bool:
+        """Filter out status text, package names, and other non-button labels."""
+        if any(keyword in norm_label for keyword in BUSY_TEXT_KEYWORDS):
+            return True
+
+        if "[" in norm_label or "]" in norm_label:
+            return True
+
+        if len(norm_label) > 35:
+            return True
+
+        if " installation manager" in norm_label:
+            return True
+
+        return False
 
     def _is_button_class(self, class_name: str) -> bool:
         """Check if a class name represents a button control."""
@@ -599,6 +669,8 @@ class GUIInstaller:
                             if text:
                                 score = self._score_button(text)
                                 if score > 0:
+                                    if not self._is_actionable_control(ctrl, ctrl_type, text):
+                                        continue
                                     # Check if control is enabled and visible
                                     try:
                                         if ctrl.is_enabled() and ctrl.is_visible():
@@ -627,6 +699,27 @@ class GUIInstaller:
             logger.debug(f"Layer 1 (pywinauto) failed: {e}")
 
         return results
+
+    def _is_actionable_control(self, ctrl: Any, ctrl_type: str, text: str) -> bool:
+        """Reject list/tree/status controls that merely contain clickable-looking text."""
+        ctrl_type_lower = (ctrl_type or "").lower()
+        text_norm = self._normalize_label(text)
+
+        if self._is_non_action_label(text_norm):
+            return False
+
+        if ctrl_type_lower in {"listitem", "treeitem"}:
+            return False
+
+        if ctrl_type_lower == "custom":
+            try:
+                rect = ctrl.rectangle()
+                if (rect.bottom - rect.top) > 90:
+                    return False
+            except Exception:
+                pass
+
+        return True
 
     def _scan_layer2_ctypes(
         self, hwnd: int
@@ -801,6 +894,10 @@ class GUIInstaller:
         """
         title = self._get_window_title(hwnd)
 
+        # A self-extract destination prompt is interactive, not "busy".
+        if self._is_self_extract_prompt(hwnd, title):
+            return False
+
         # Check title for busy keywords
         if self._is_busy_window(title):
             logger.info(f"Busy state detected from title: '{title}'")
@@ -810,11 +907,233 @@ class GUIInstaller:
         if self._detect_progress_bar(hwnd):
             return True
 
+        # Check visible text content for status/progress phrases.
+        if self._has_busy_text(hwnd):
+            logger.info(f"Busy state detected from child text in window: '{title}'")
+            return True
+
         return False
+
+    def _has_busy_text(self, hwnd: int) -> bool:
+        """Detect textual status content that indicates installation is still active."""
+        title = self._get_window_title(hwnd)
+        if not self._should_use_busy_text(title):
+            return False
+
+        if _HAS_PYWINAUTO:
+            try:
+                app = Application(backend="uia").connect(handle=hwnd, timeout=3)
+                dlg = app.window(handle=hwnd)
+                for ctrl in dlg.descendants():
+                    try:
+                        text = ctrl.window_text()
+                    except Exception:
+                        continue
+                    norm = self._normalize_label(text)
+                    if norm and any(keyword in norm for keyword in BUSY_TEXT_KEYWORDS):
+                        return True
+            except Exception:
+                pass
+
+        user32 = ctypes.windll.user32
+        found = False
+
+        @ctypes.WINFUNCTYPE(
+            ctypes.wintypes.BOOL,
+            ctypes.wintypes.HWND,
+            ctypes.wintypes.LPARAM,
+        )
+        def enum_callback(child_hwnd, _lparam):
+            nonlocal found
+            try:
+                if not user32.IsWindowVisible(child_hwnd):
+                    return True
+                text_len = user32.GetWindowTextLengthW(child_hwnd)
+                if text_len <= 0:
+                    return True
+                text_buf = ctypes.create_unicode_buffer(text_len + 1)
+                user32.GetWindowTextW(child_hwnd, text_buf, text_len + 1)
+                norm = self._normalize_label(text_buf.value)
+                if norm and any(keyword in norm for keyword in BUSY_TEXT_KEYWORDS):
+                    found = True
+                    return False
+            except Exception:
+                pass
+            return True
+
+        try:
+            user32.EnumChildWindows(hwnd, enum_callback, 0)
+        except Exception:
+            pass
+
+        return found
+
+    def _should_use_busy_text(self, title: str) -> bool:
+        """Limit child-text busy detection to pages that are likely progress screens."""
+        title_lower = (title or "").lower()
+
+        blocked_page_keywords = (
+            "selection page",
+            "license page",
+            "start page",
+            "welcome",
+            "finish page",
+            "summary page",
+        )
+        if any(keyword in title_lower for keyword in blocked_page_keywords):
+            return False
+
+        allowed_page_keywords = (
+            "installation page",
+            "download page",
+            "progress",
+            "please wait",
+            "extracting",
+            "installing",
+            "configuring",
+        )
+        return any(keyword in title_lower for keyword in allowed_page_keywords)
 
     # ──────────────────────────────────────────────
     # Special edge-case handlers
     # ──────────────────────────────────────────────
+
+    def _handle_special_installer_windows(self, hwnd: int) -> bool:
+        """Handle known custom dialogs before generic button scanning."""
+        if hwnd in self._handled_special_windows:
+            return False
+
+        title = self._get_window_title(hwnd)
+        if self._is_self_extract_prompt(hwnd, title):
+            print("    Handling Autodesk self-extract prompt...")
+            if self._submit_self_extract_dialog(hwnd):
+                self._handled_special_windows.add(hwnd)
+                return True
+
+        return False
+
+    def _is_self_extract_prompt(self, hwnd: int, title: str = "") -> bool:
+        """Identify self-extract dialogs that ask for a destination folder."""
+        title_lower = (title or self._get_window_title(hwnd)).lower()
+        if "self-extract" not in title_lower and "extract to" not in title_lower:
+            return False
+        return self._window_has_edit_control(hwnd)
+
+    def _window_has_edit_control(self, hwnd: int) -> bool:
+        """Return True if the window contains a visible/editable text field."""
+        if _HAS_PYWINAUTO:
+            try:
+                app = Application(backend="uia").connect(handle=hwnd, timeout=3)
+                dlg = app.window(handle=hwnd)
+                for ctrl in dlg.descendants(control_type="Edit"):
+                    try:
+                        if ctrl.is_visible():
+                            return True
+                    except Exception:
+                        return True
+            except Exception:
+                pass
+
+        user32 = ctypes.windll.user32
+        found = False
+
+        @ctypes.WINFUNCTYPE(
+            ctypes.wintypes.BOOL,
+            ctypes.wintypes.HWND,
+            ctypes.wintypes.LPARAM,
+        )
+        def enum_callback(child_hwnd, _lparam):
+            nonlocal found
+            try:
+                class_buf = ctypes.create_unicode_buffer(256)
+                user32.GetClassNameW(child_hwnd, class_buf, 256)
+                if class_buf.value.lower() == "edit":
+                    found = True
+                    return False
+            except Exception:
+                pass
+            return True
+
+        try:
+            user32.EnumChildWindows(hwnd, enum_callback, 0)
+        except Exception:
+            pass
+
+        return found
+
+    def _submit_self_extract_dialog(self, hwnd: int) -> bool:
+        """Fill the destination field and confirm the self-extract dialog."""
+        target_dir = self._target_dir
+        if not target_dir:
+            return False
+
+        os.makedirs(target_dir, exist_ok=True)
+
+        if _HAS_PYWINAUTO:
+            try:
+                app = Application(backend="uia").connect(handle=hwnd, timeout=3)
+                dlg = app.window(handle=hwnd)
+                edits = dlg.descendants(control_type="Edit")
+                if edits:
+                    edit = edits[0]
+                    try:
+                        edit.set_edit_text(target_dir)
+                    except Exception:
+                        try:
+                            edit.click_input()
+                            edit.type_keys("^a{BACKSPACE}", set_foreground=True)
+                            edit.type_keys(target_dir, with_spaces=True, set_foreground=True)
+                        except Exception:
+                            pass
+
+                    self._bring_to_foreground(hwnd)
+                    try:
+                        dlg.type_keys("{ENTER}")
+                    except Exception:
+                        if _HAS_PYAUTOGUI:
+                            pyautogui.press("enter")
+                    logger.info(f"Submitted self-extract dialog to: {target_dir}")
+                    return True
+            except Exception as e:
+                logger.debug(f"Self-extract handler (pywinauto) failed: {e}")
+
+        user32 = ctypes.windll.user32
+        WM_SETTEXT = 0x000C
+        WM_KEYDOWN = 0x0100
+        WM_KEYUP = 0x0101
+        VK_RETURN = 0x0D
+        edit_hwnd = None
+
+        @ctypes.WINFUNCTYPE(
+            ctypes.wintypes.BOOL,
+            ctypes.wintypes.HWND,
+            ctypes.wintypes.LPARAM,
+        )
+        def enum_callback(child_hwnd, _lparam):
+            nonlocal edit_hwnd
+            try:
+                class_buf = ctypes.create_unicode_buffer(256)
+                user32.GetClassNameW(child_hwnd, class_buf, 256)
+                if class_buf.value.lower() == "edit":
+                    edit_hwnd = child_hwnd
+                    return False
+            except Exception:
+                pass
+            return True
+
+        try:
+            user32.EnumChildWindows(hwnd, enum_callback, 0)
+            if edit_hwnd:
+                user32.SendMessageW(edit_hwnd, WM_SETTEXT, 0, target_dir)
+                self._bring_to_foreground(hwnd)
+                user32.PostMessageW(hwnd, WM_KEYDOWN, VK_RETURN, 0)
+                user32.PostMessageW(hwnd, WM_KEYUP, VK_RETURN, 0)
+                logger.info(f"Submitted self-extract dialog via ctypes to: {target_dir}")
+                return True
+        except Exception as e:
+            logger.debug(f"Self-extract handler (ctypes) failed: {e}")
+
+        return False
 
     def _handle_license_agreements(self, hwnd: int) -> bool:
         """
@@ -822,6 +1141,7 @@ class GUIInstaller:
         Returns True if any license control was found and activated.
         """
         handled = False
+        self._bring_to_foreground(hwnd)
 
         if _HAS_PYWINAUTO:
             try:
@@ -831,14 +1151,15 @@ class GUIInstaller:
                 # Check radio buttons
                 for ctrl in dlg.descendants(control_type="RadioButton"):
                     try:
-                        text = ctrl.window_text().lower()
-                        if any(kw in text for kw in LICENSE_KEYWORDS):
+                        text = self._get_control_text_with_neighbors(ctrl, dlg).lower()
+                        if self._looks_like_license_acceptance_text(text):
                             try:
                                 ctrl.select()
                             except Exception:
+                                self._bring_to_foreground(hwnd)
                                 ctrl.click_input()
                             logger.info(
-                                f"License accepted (radio): {ctrl.window_text()}"
+                                f"License accepted (radio): {text or ctrl.window_text()}"
                             )
                             handled = True
                             time.sleep(0.5)
@@ -849,22 +1170,26 @@ class GUIInstaller:
                 # Check checkboxes
                 for ctrl in dlg.descendants(control_type="CheckBox"):
                     try:
-                        text = ctrl.window_text().lower()
-                        if any(kw in text for kw in LICENSE_KEYWORDS):
+                        text = self._get_control_text_with_neighbors(ctrl, dlg).lower()
+                        if self._looks_like_license_acceptance_text(text):
                             try:
                                 if not ctrl.get_toggle_state():
                                     ctrl.toggle()
                             except Exception:
+                                self._bring_to_foreground(hwnd)
                                 ctrl.click_input()
                             logger.info(
                                 f"License accepted (checkbox): "
-                                f"{ctrl.window_text()}"
+                                f"{text or ctrl.window_text()}"
                             )
                             handled = True
                             time.sleep(0.5)
                             break
                     except Exception:
                         continue
+
+                if not handled and self._is_license_page(hwnd):
+                    handled = self._toggle_first_unchecked_option_on_license_page(dlg, hwnd)
 
             except Exception as e:
                 logger.debug(f"License handler (pywinauto) failed: {e}")
@@ -903,7 +1228,7 @@ class GUIInstaller:
                             child_hwnd, text_buf, text_len + 1
                         )
                         text = text_buf.value.lower()
-                        if any(kw in text for kw in LICENSE_KEYWORDS):
+                        if self._looks_like_license_acceptance_text(text):
                             # Check if it's unchecked and check it
                             state = user32.SendMessageW(
                                 child_hwnd, BM_GETCHECK, 0, 0
@@ -926,7 +1251,142 @@ class GUIInstaller:
         except Exception:
             pass
 
+        if not handled and self._is_license_page(hwnd):
+            handled = self._handle_license_ctypes_first_option(hwnd)
+
         return handled
+
+    def _looks_like_license_acceptance_text(self, text: str) -> bool:
+        norm = self._normalize_label(text or "")
+        return any(kw in norm for kw in LICENSE_KEYWORDS)
+
+    def _is_license_page(self, hwnd: int) -> bool:
+        title = self._normalize_label(self._get_window_title(hwnd))
+        if "license" in title or "agreement" in title:
+            return True
+        return False
+
+    def _get_control_text_with_neighbors(self, ctrl: Any, dlg: Any) -> str:
+        """Return a control's own text plus nearby text controls on the same row."""
+        parts: List[str] = []
+        try:
+            own_text = ctrl.window_text()
+            if own_text:
+                parts.append(own_text)
+        except Exception:
+            pass
+
+        try:
+            ctrl_rect = ctrl.rectangle()
+        except Exception:
+            return " ".join(parts)
+
+        try:
+            for neighbor in dlg.descendants():
+                if neighbor is ctrl:
+                    continue
+                try:
+                    text = neighbor.window_text()
+                    if not text:
+                        continue
+                    rect = neighbor.rectangle()
+                    same_row = abs(rect.top - ctrl_rect.top) <= 24
+                    to_right = rect.left >= ctrl_rect.left - 8
+                    close = rect.left - ctrl_rect.right <= 420
+                    if same_row and to_right and close:
+                        parts.append(text)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        return " ".join(parts)
+
+    def _toggle_first_unchecked_option_on_license_page(self, dlg: Any, hwnd: int) -> bool:
+        """Fallback for installers where the label is separate from the checkbox."""
+        candidates: List[Any] = []
+        for control_type in ("CheckBox", "RadioButton"):
+            try:
+                candidates.extend(dlg.descendants(control_type=control_type))
+            except Exception:
+                continue
+
+        for ctrl in candidates:
+            try:
+                rect = ctrl.rectangle()
+                if rect.top < 100:
+                    continue
+                state = None
+                try:
+                    state = ctrl.get_toggle_state()
+                except Exception:
+                    try:
+                        state = ctrl.get_check_state()
+                    except Exception:
+                        pass
+                if state:
+                    return True
+                self._bring_to_foreground(hwnd)
+                try:
+                    ctrl.toggle()
+                except Exception:
+                    ctrl.click_input()
+                logger.info("License accepted using fallback checkbox/radio selection")
+                time.sleep(0.5)
+                return True
+            except Exception:
+                continue
+        return False
+
+    def _handle_license_ctypes_first_option(self, hwnd: int) -> bool:
+        """ctypes fallback for license pages whose label text is separate from the checkbox."""
+        user32 = ctypes.windll.user32
+        BM_GETCHECK = 0x00F0
+        BM_CLICK = 0x00F5
+        BST_CHECKED = 1
+        candidates: List[Tuple[int, int]] = []
+
+        @ctypes.WINFUNCTYPE(
+            ctypes.wintypes.BOOL,
+            ctypes.wintypes.HWND,
+            ctypes.wintypes.LPARAM,
+        )
+        def enum_callback(child_hwnd, _lparam):
+            try:
+                if not user32.IsWindowVisible(child_hwnd) or not user32.IsWindowEnabled(child_hwnd):
+                    return True
+                class_buf = ctypes.create_unicode_buffer(256)
+                user32.GetClassNameW(child_hwnd, class_buf, 256)
+                class_name = class_buf.value.lower()
+                if "button" not in class_name:
+                    return True
+                rect = ctypes.wintypes.RECT()
+                user32.GetWindowRect(child_hwnd, ctypes.byref(rect))
+                if rect.top < 100:
+                    return True
+                candidates.append((rect.top, child_hwnd))
+            except Exception:
+                pass
+            return True
+
+        try:
+            user32.EnumChildWindows(hwnd, enum_callback, 0)
+        except Exception:
+            return False
+
+        for _top, child_hwnd in sorted(candidates, key=lambda item: item[0]):
+            try:
+                state = user32.SendMessageW(child_hwnd, BM_GETCHECK, 0, 0)
+                if state == BST_CHECKED:
+                    return True
+                self._bring_to_foreground(hwnd)
+                user32.SendMessageW(child_hwnd, BM_CLICK, 0, 0)
+                logger.info("License accepted (ctypes fallback first option)")
+                time.sleep(0.5)
+                return True
+            except Exception:
+                continue
+        return False
 
     def _handle_launch_checkboxes(self, hwnd: int, is_finish: bool) -> None:
         """
@@ -1185,6 +1645,11 @@ class GUIInstaller:
                 logger.info(f"New installer window detected: '{title}'")
                 # Bring new window to foreground
                 self._bring_to_foreground(hwnd)
+
+            # Handle extractor prompts and other custom dialogs before generic logic.
+            if self._handle_special_installer_windows(hwnd):
+                time.sleep(interval)
+                continue
 
             # ── Step 0: Check if installer is busy (progress bar, extracting, etc.) ──
             if self._detect_busy_state(hwnd):

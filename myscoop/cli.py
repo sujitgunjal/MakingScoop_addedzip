@@ -29,6 +29,8 @@ from myscoop.path_manager import PathManager, PathManagerError
 from myscoop.dependency import DependencyResolver, CircularDependencyError
 from myscoop.bucket import BucketManager, BucketError
 from myscoop.metadata import AppMetadata
+from myscoop.local_manifest import LocalManifestManager, LocalManifestError
+from myscoop.uninstaller import uninstall_app as perform_uninstall, UninstallError
 
 try:
     from myscoop.gui_installer import GUIInstaller, GUIInstallError
@@ -102,6 +104,12 @@ def handle_errors(func):
             sys.exit(1)
         except PathManagerError as e:
             click.echo(f"\n{Fore.RED}PATH Error: {e}{Style.RESET_ALL}")
+            sys.exit(1)
+        except LocalManifestError as e:
+            click.echo(f"\n{Fore.RED}Manifest Error: {e}{Style.RESET_ALL}")
+            sys.exit(1)
+        except UninstallError as e:
+            click.echo(f"\n{Fore.RED}Uninstall Error: {e}{Style.RESET_ALL}")
             sys.exit(1)
         except KeyboardInterrupt:
             click.echo(f"\n{Fore.YELLOW}Cancelled by user.{Style.RESET_ALL}")
@@ -181,78 +189,31 @@ def install_single_app(
         app_dir = os.path.join(APPS_DIR, app_name, manifest.version)
         os.makedirs(app_dir, exist_ok=True)
 
-        # For GUI installers with a local file:
-        #   1. Extract the self-extracting exe with 7z (no UAC)
-        #   2. Locate gui_exe inside the extracted dir
-        #   3. Run GUI automation on that specific setup exe
-        if manifest.installer_needs_gui and local_file:
-            # Step 1: Extract (treat as 7z self-extracting archive)
-            click.echo(
-                f"{Fore.BLUE}  Extracting "
-                f"{os.path.basename(filepath)} ...{Style.RESET_ALL}"
-            )
-            extractor = Extractor(APPS_DIR)
-            try:
+        if local_file:
+            ext = Path(filepath).suffix.lower()
+            if ext in {".zip", ".7z"}:
+                extractor = Extractor(APPS_DIR)
                 extractor.extract(
                     filepath=filepath,
                     app_name=app_name,
                     version=manifest.version,
                     extract_dir=manifest.extract_dir,
-                    url_hint=f"#/{os.path.basename(filepath)}",
+                    url_hint=manifest.url_hint or f"#/{os.path.basename(filepath)}",
+                    installer_type=manifest.installer_type,
                 )
-            except Exception as e:
-                # If extraction fails (e.g. it's a standard non-SFX installer like InnoSetup),
-                # just log a warning and fallback to running the original exe
-                click.echo(f"{Fore.YELLOW}  Not a self-extracting archive. Running directly...{Style.RESET_ALL}")
-                pass
-
-            # Step 2: Find the gui_exe inside extracted dir
-            gui_exe = manifest.gui_exe
-            if gui_exe and os.path.isfile(os.path.join(app_dir, gui_exe)):
-                gui_exe_path = os.path.join(app_dir, gui_exe)
-            else:
-                # No gui_exe specified OR missing after failed extraction — fallback to original
-                gui_exe_path = filepath
-
-            if os.path.isfile(gui_exe_path):
-                click.echo(
-                    f"{Fore.BLUE}  Launching GUI automation on "
-                    f"{os.path.basename(gui_exe_path)} ...{Style.RESET_ALL}"
-                )
-                if _HAS_GUI_INSTALLER:
-                    gui = GUIInstaller()
-                    success = gui.install(gui_exe_path, app_dir)
-                    if success:
-                        click.echo(
-                            f"{Fore.GREEN}  GUI automation "
-                            f"completed ✓{Style.RESET_ALL}"
-                        )
-                    else:
-                        click.echo(
-                            f"{Fore.RED}  GUI automation "
-                            f"reported failure{Style.RESET_ALL}"
-                        )
-                else:
-                    click.echo(
-                        f"{Fore.YELLOW}  GUI automation unavailable. "
-                        f"Install deps: pip install pywinauto "
-                        f"pyautogui psutil{Style.RESET_ALL}"
-                    )
             else:
                 click.echo(
-                    f"{Fore.YELLOW}  GUI exe not found after extraction: "
-                    f"{gui_exe_path}{Style.RESET_ALL}"
+                    f"{Fore.BLUE}  Attempting silent installation first ...{Style.RESET_ALL}"
+                )
+                silent_installer = SilentInstaller(APPS_DIR)
+                silent_installer.install(
+                    filepath=filepath,
+                    app_dir=app_dir,
+                    installer_type=manifest.installer_type or None,
                 )
                 click.echo(
-                    f"{Fore.YELLOW}  Contents of app dir:{Style.RESET_ALL}"
+                    f"{Fore.GREEN}  Local installer completed ✓{Style.RESET_ALL}"
                 )
-                for root, dirs, files in os.walk(app_dir):
-                    for f in files:
-                        rel = os.path.relpath(os.path.join(root, f), app_dir)
-                        click.echo(f"    {rel}")
-                    if len(list(os.walk(app_dir))) > 20:
-                        click.echo("    ... (truncated)")
-                        break
 
         # For GUI installers downloaded from URL, extract first, then run gui_exe
         elif manifest.installer_needs_gui:
@@ -431,13 +392,14 @@ def cli():
 @cli.command()
 @click.argument("app")
 @click.option(
-    "--file", "local_file", default=None, type=click.Path(exists=True),
+    "--file", "local_file", default=None, type=click.Path(exists=True, dir_okay=False),
     help="Path to a local installer exe (skips download)."
 )
 @handle_errors
 def install(app: str, local_file: Optional[str] = None):
     """Install an application."""
     buckets_dir = get_buckets_dir()
+    app, local_file = _resolve_install_target(app, local_file, buckets_dir)
 
     # Resolve dependencies
     resolver = DependencyResolver(APPS_DIR, buckets_dir)
@@ -457,6 +419,26 @@ def install(app: str, local_file: Optional[str] = None):
         install_single_app(dep_name, buckets_dir, is_dependency=is_dep, local_file=file_arg)
 
 
+def _resolve_install_target(
+    app: str,
+    local_file: Optional[str],
+    buckets_dir: str,
+) -> tuple[str, Optional[str]]:
+    """Allow install to accept either an app name or an installer path."""
+    manager = LocalManifestManager(buckets_dir)
+
+    if local_file:
+        app_name = manager.ensure_manifest(local_file, app_name=app)
+        return app_name, os.path.abspath(local_file)
+
+    if os.path.isfile(app):
+        local_path = os.path.abspath(app)
+        app_name = manager.ensure_manifest(local_path)
+        return app_name, local_path
+
+    return app.lower(), None
+
+
 # ──────────────────────────────────────────────
 # uninstall
 # ──────────────────────────────────────────────
@@ -466,37 +448,22 @@ def install(app: str, local_file: Optional[str] = None):
 @handle_errors
 def uninstall(app: str):
     """Uninstall an application."""
-    app_lower = app.lower()
-    app_path = os.path.join(APPS_DIR, app_lower)
-
-    if not os.path.exists(app_path):
-        click.echo(f"{Fore.RED}'{app}' is not installed.{Style.RESET_ALL}")
-        sys.exit(1)
-
     buckets_dir = get_buckets_dir()
 
-    # Try to load manifest to find bin entries and shortcuts to clean up
-    try:
-        manifest = Manifest(app_lower, buckets_dir)
-        bin_entries = manifest.bin
-        shortcuts = manifest.shortcuts
-    except ManifestNotFoundError:
-        bin_entries = []
-        shortcuts = []
+    result = perform_uninstall(
+        app,
+        buckets_dir,
+        APPS_DIR,
+        SHIMS_DIR,
+        _remove_shortcut,
+        log=click.echo,
+    )
+    click.echo(f"\n{Fore.GREEN}{result['message']}{Style.RESET_ALL}")
+    return
 
-    # Remove shims
-    if bin_entries:
-        shim_manager = ShimManager(SHIMS_DIR)
-        removed = shim_manager.remove_shims_for_app(bin_entries)
-        click.echo(f"  Removed {removed} shim(s)")
+    click.echo(f"\n{Fore.GREEN}{result['message']} âœ“{Style.RESET_ALL}")
 
-    # Remove shortcuts
-    for shortcut_entry in shortcuts:
-        if len(shortcut_entry) >= 2:
-            _remove_shortcut(shortcut_entry[1])
 
-    # Delete app folder
-    shutil.rmtree(app_path, ignore_errors=True)
     click.echo(f"\n{Fore.GREEN}'{app}' uninstalled successfully ✓{Style.RESET_ALL}")
 
 

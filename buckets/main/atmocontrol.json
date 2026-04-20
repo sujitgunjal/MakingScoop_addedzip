@@ -5,5 +5,9 @@
     "license": "Freeware",
     "installer": {
         "type": "gui"
+    },
+    "uninstaller": {
+        "type": "gui",
+        "source": "installer"
     }
 }

@@ -1,11 +1,14 @@
 """
 silent_installer.py — GUI Installer Suppression for myscoop
 
-Handles GUI-only installers by trying multiple silent strategies in order:
-    1. 7z extraction   — treat the exe as a 7z archive (never runs installer)
-    2. MSI silent      — msiexec /a /qn TARGETDIR=
-    3. NSIS silent     — exe /S /D=
-    4. Inno Setup      — exe /VERYSILENT /SUPPRESSMSGBOXES /DIR=
+Handles local installers by trying multiple strategies in order:
+    1. MSI silent      — msiexec /a /qn TARGETDIR=
+    2. NSIS silent     — exe /S /D=
+    3. Inno Setup      — exe /VERYSILENT /SUPPRESSMSGBOXES /DIR=
+    4. GUI automation  — existing UI automation fallback
+
+Archive extraction is reserved for actual archive inputs like .7z/.zip
+or when a manifest explicitly marks the payload as type "7z".
 
 Each strategy is tried in order. If one fails, the next is attempted.
 
@@ -16,6 +19,9 @@ Usage:
 
 import os
 import subprocess
+import time
+import ctypes
+import ctypes.wintypes
 from pathlib import Path
 from typing import List, Optional
 
@@ -38,10 +44,10 @@ class SilentInstallError(Exception):
 
 class SilentInstaller:
     """
-    Suppresses GUI installers using a multi-strategy cascade.
+    Runs installers using a silent-first cascade.
 
-    Strategies are tried in order from safest (7z extraction, no code runs)
-    to least safe (running the installer with silent flags).
+    Real installer execution is preferred for .exe/.msi inputs so that
+    "success" means the application was actually installed, not just unpacked.
     """
 
     # Common locations where 7-Zip CLI is installed
@@ -49,6 +55,15 @@ class SilentInstaller:
         r"C:\Program Files\7-Zip\7z.exe",
         r"C:\Program Files (x86)\7-Zip\7z.exe",
     ]
+    _INTERACTIVE_WINDOW_KEYWORDS = (
+        "setup",
+        "install",
+        "installer",
+        "wizard",
+        "extract",
+        "self-extract",
+        "extract to",
+    )
 
     def __init__(self, apps_dir: str) -> None:
         """
@@ -65,13 +80,15 @@ class SilentInstaller:
         installer_type: Optional[str] = None,
     ) -> bool:
         """
-        Try to silently install/extract an exe installer.
+        Try to silently install an installer file.
 
         Tries strategies in this exact order:
-            1. 7z extraction
-            2. MSI silent (if .msi file)
+            1. Explicit manifest hint
+            2. MSI silent (for .msi)
             3. NSIS silent (/S)
             4. Inno Setup silent (/VERYSILENT)
+            5. Archive extraction for archive payloads only
+            6. GUI automation
 
         Args:
             filepath:       Path to the installer file.
@@ -97,18 +114,26 @@ class SilentInstaller:
                     return True
                 except Exception as e:
                     errors.append(f"{installer_type}: {e}")
+                    if installer_type.lower() == "gui":
+                        error_details = "\n    ".join(errors)
+                        raise SilentInstallError(
+                            f"Explicit GUI automation failed for: {filepath}\n"
+                            f"  Errors:\n    {error_details}"
+                        )
 
-        # Strategy 1: 7z extraction (safest — never runs the installer)
-        if installer_type != "msi":  # Skip 7z for .msi files
+        archive_like_type = installer_type.lower() if installer_type else None
+        is_archive_payload = ext in {".7z", ".zip"} or archive_like_type in {"7z", "zip"}
+
+        if is_archive_payload:
             try:
-                print("  Trying: 7z extraction ...")
+                print("  Trying: archive extraction ...")
                 self._strategy_7z(filepath, app_dir)
-                print("  Strategy: 7z extraction succeeded")
+                print("  Strategy: archive extraction succeeded")
                 return True
             except Exception as e:
-                errors.append(f"7z: {e}")
+                errors.append(f"archive: {e}")
 
-        # Strategy 2: MSI silent (for .msi files)
+        # Strategy 1: MSI silent (for .msi files)
         if ext == ".msi" or installer_type == "msi":
             try:
                 print("  Trying: MSI silent install ...")
@@ -118,7 +143,7 @@ class SilentInstaller:
             except Exception as e:
                 errors.append(f"MSI: {e}")
 
-        # Strategy 3: NSIS silent (/S)
+        # Strategy 2/3: executable installers
         if ext == ".exe":
             detected = self.detect_installer_type(filepath)
 
@@ -141,7 +166,7 @@ class SilentInstaller:
                 except Exception as e:
                     errors.append(f"Inno: {e}")
 
-            # If detection was inconclusive, try both NSIS and Inno
+            # If detection was inconclusive, try both common silent modes
             if detected is None and installer_type not in ("nsis", "inno"):
                 try:
                     print("  Trying: NSIS silent install ...")
@@ -159,7 +184,29 @@ class SilentInstaller:
                 except Exception as e:
                     errors.append(f"Inno: {e}")
 
-        # Strategy 5: GUI automation (last resort)
+            # Some setup.exe files are really extractable archives containing
+            # MSI/MSIZip payloads. Prefer extraction over blind GUI driving.
+            if self._looks_like_extractable_setup(filepath):
+                try:
+                    print("  Trying: archive extraction ...")
+                    self._strategy_7z(filepath, app_dir)
+                    print("  Strategy: archive extraction succeeded")
+                    return True
+                except Exception as e:
+                    errors.append(f"archive: {e}")
+
+        # For non-exe archive-like payloads that were not explicitly marked,
+        # try extraction before GUI fallback.
+        if ext in {".7z", ".zip"} and not is_archive_payload:
+            try:
+                print("  Trying: archive extraction ...")
+                self._strategy_7z(filepath, app_dir)
+                print("  Strategy: archive extraction succeeded")
+                return True
+            except Exception as e:
+                errors.append(f"archive: {e}")
+
+        # Strategy 4/5: GUI automation (last resort for installers)
         if _HAS_GUI_INSTALLER:
             try:
                 print("  Trying: GUI automation ...")
@@ -228,34 +275,25 @@ class SilentInstaller:
 
     def _strategy_nsis(self, filepath: str, app_dir: str) -> None:
         """Strategy 3: NSIS installer with /S (silent) and /D= (target dir)."""
-        result = subprocess.run(
-            [filepath, "/S", f"/D={app_dir}"],
-            capture_output=True,
-            text=True,
+        self._run_executable_strategy(
+            filepath,
+            ["/S", f"/D={app_dir}"],
             timeout=300,
+            strategy_name="NSIS",
         )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"NSIS installer exited with code {result.returncode}"
-            )
 
     def _strategy_inno(self, filepath: str, app_dir: str) -> None:
         """Strategy 4: Inno Setup with /VERYSILENT /SUPPRESSMSGBOXES /DIR=."""
-        result = subprocess.run(
+        self._run_executable_strategy(
+            filepath,
             [
-                filepath,
                 "/VERYSILENT",
                 "/SUPPRESSMSGBOXES",
                 f"/DIR={app_dir}",
             ],
-            capture_output=True,
-            text=True,
             timeout=300,
+            strategy_name="Inno Setup",
         )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Inno Setup exited with code {result.returncode}"
-            )
 
     def _strategy_gui(self, filepath: str, app_dir: str) -> None:
         """Strategy 5: GUI automation — drive the installer wizard via UI tree."""
@@ -340,3 +378,155 @@ class SilentInstaller:
             "gui": self._strategy_gui,
         }
         return type_map.get(installer_type.lower())
+
+    def _looks_like_extractable_setup(self, filepath: str) -> bool:
+        """
+        Detect EXEs that are better treated as archives.
+
+        This catches installers like MAPSetup.exe where 7-Zip can list MSI/MSIZip
+        contents directly, so extraction is a safer path than GUI automation.
+        """
+        if not self._7z_exe:
+            return False
+
+        try:
+            result = subprocess.run(
+                [self._7z_exe, "l", filepath],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except Exception:
+            return False
+
+        if result.returncode != 0:
+            return False
+
+        listing = f"{result.stdout}\n{result.stderr}".lower()
+        archive_markers = (
+            "method = msizip",
+            " msizip",
+            ".msi",
+            ".cab",
+        )
+        return any(marker in listing for marker in archive_markers)
+
+    def _run_executable_strategy(
+        self,
+        filepath: str,
+        args: List[str],
+        timeout: int,
+        strategy_name: str,
+    ) -> None:
+        """
+        Run an EXE-based silent strategy, but fail fast if it shows UI.
+        """
+        # Inject RunAsInvoker to bypass embedded requireAdministrator manifests 
+        # so Windows doesn't immediately throw WinError 740 and we can stay silent.
+        env = os.environ.copy()
+        env["__COMPAT_LAYER"] = "RunAsInvoker"
+
+        try:
+            process = subprocess.Popen(
+                [filepath, *args],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=env,
+            )
+        except OSError as e:
+            if getattr(e, "winerror", None) == 740:
+                print(f"  Elevation required for {strategy_name} despite RunAsInvoker. Requesting UAC...")
+                # Escape arguments for PowerShell
+                ps_args = " ".join(args)
+                ps_cmd = f"Start-Process -FilePath '{filepath}' -ArgumentList '{ps_args}' -Wait -WindowStyle Hidden"
+                result = subprocess.run(["powershell", "-Command", ps_cmd], check=False, timeout=timeout)
+                if result.returncode != 0:
+                    raise RuntimeError(f"{strategy_name} elevated installer exited with code {result.returncode}")
+                return
+            raise
+
+        deadline = time.time() + timeout
+        first_detection_deadline = time.time() + 15
+
+        while time.time() < deadline:
+            returncode = process.poll()
+            if returncode is not None:
+                if returncode != 0:
+                    raise RuntimeError(
+                        f"{strategy_name} installer exited with code {returncode}"
+                    )
+                return
+
+            if (
+                time.time() <= first_detection_deadline
+                and self._has_interactive_window(process.pid)
+            ):
+                self._terminate_process(process)
+                raise RuntimeError(
+                    f"{strategy_name} installer ignored silent flags and opened interactive UI"
+                )
+
+            time.sleep(0.5)
+
+        self._terminate_process(process)
+        raise RuntimeError(
+            f"{strategy_name} installer timed out after {timeout}s"
+        )
+
+    def _terminate_process(self, process: subprocess.Popen) -> None:
+        """Best-effort cleanup for timed out or interactive processes."""
+        try:
+            process.terminate()
+            process.wait(timeout=5)
+        except Exception:
+            try:
+                process.kill()
+                process.wait(timeout=5)
+            except Exception:
+                pass
+
+    def _has_interactive_window(self, pid: int) -> bool:
+        """Detect whether a visible top-level installer window appeared."""
+        try:
+            user32 = ctypes.windll.user32
+        except AttributeError:
+            return False
+
+        found = False
+
+        @ctypes.WINFUNCTYPE(
+            ctypes.wintypes.BOOL,
+            ctypes.wintypes.HWND,
+            ctypes.wintypes.LPARAM,
+        )
+        def enum_callback(hwnd, _lparam):
+            nonlocal found
+
+            if found or not user32.IsWindowVisible(hwnd):
+                return True
+
+            window_pid = ctypes.wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(window_pid))
+            if window_pid.value != pid:
+                return True
+
+            length = user32.GetWindowTextLengthW(hwnd)
+            if length <= 0:
+                return True
+
+            title_buffer = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, title_buffer, length + 1)
+            title = title_buffer.value.lower()
+
+            if any(keyword in title for keyword in self._INTERACTIVE_WINDOW_KEYWORDS):
+                found = True
+                return False
+
+            return True
+
+        try:
+            user32.EnumWindows(enum_callback, 0)
+        except Exception:
+            return False
+
+        return found

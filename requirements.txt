@@ -8,3 +8,5 @@ pywin32
 pywinauto
 pyautogui
 psutil
+fastapi
+uvicorn

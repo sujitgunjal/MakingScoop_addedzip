@@ -271,6 +271,12 @@ class Manifest:
         return self._data.get("post_install", [])
 
     @property
+    def uninstaller(self) -> Dict[str, Any]:
+        """Optional uninstall configuration dict."""
+        value = self._data.get("uninstaller", {})
+        return value if isinstance(value, dict) else {}
+
+    @property
     def raw_data(self) -> Dict[str, Any]:
         """The complete raw manifest dict (for debugging / info display)."""
         return self._data
